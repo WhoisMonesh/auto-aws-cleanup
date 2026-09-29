@@ -8,13 +8,18 @@ import (
 	"strings"
 )
 
-// Config represents the cleanup configuration
 type Config struct {
 	Profile            string   `json:"profile"`
 	Regions            []string `json:"regions"`
 	ExcludedTypes      []string `json:"excluded_types"`
 	DryRun             bool     `json:"dry_run"`
 	SkipIAMCredentials bool     `json:"skip_iam_credentials"`
+}
+
+type Resource struct {
+	ID     string
+	Type   string
+	Region string
 }
 
 var safeRegions = []string{"us-east-1", "us-west-2", "eu-west-1"}
@@ -24,7 +29,6 @@ func main() {
 		printHelp()
 		os.Exit(0)
 	}
-
 	switch os.Args[1] {
 	case "init":
 		initConfig()
@@ -37,14 +41,14 @@ func main() {
 	case "status":
 		status()
 	case "version":
-		fmt.Println("v0.1.0")
+		fmt.Println("v0.2.0")
 	default:
 		printHelp()
 	}
 }
 
 func printHelp() {
-	fmt.Println("Auto AWS Cleanup - Simplified AWS resource cleanup tool")
+	fmt.Println("Auto AWS Cleanup v0.2.0")
 	fmt.Println("")
 	fmt.Println("Usage:")
 	fmt.Println("  auto-aws-cleanup init     - Create configuration file")
@@ -52,6 +56,7 @@ func printHelp() {
 	fmt.Println("  auto-aws-cleanup list     - List all resources")
 	fmt.Println("  auto-aws-cleanup clean    - Clean all resources")
 	fmt.Println("  auto-aws-cleanup status   - Show current status")
+	fmt.Println("  auto-aws-cleanup version  - Show version")
 }
 
 func initConfig() {
@@ -62,7 +67,6 @@ func initConfig() {
 		DryRun:             true,
 		SkipIAMCredentials: true,
 	}
-
 	data, _ := json.MarshalIndent(config, "", "  ")
 	os.WriteFile(".auto-aws-config.json", data, 0644)
 	fmt.Println("✓ Configuration created: .auto-aws-config.json")
@@ -75,7 +79,7 @@ func auth() {
 		fmt.Println("❌ AWS CLI not configured - run: aws configure")
 		os.Exit(1)
 	}
-	fmt.Printf("  %s", string(output))
+	fmt.Println(string(output))
 	fmt.Println("✓ AWS credentials verified")
 }
 
@@ -89,24 +93,168 @@ func listResources() {
 	output, _ := cmd.CombinedOutput()
 	fmt.Printf("\nAccount: %s\n", strings.TrimSpace(string(output)))
 	fmt.Println("")
+	var totalResources []Resource
 	for _, region := range config.Regions {
-		fmt.Printf("  Checking %s...\n", region)
+		fmt.Printf("  📍 Scanning %s...\n", region)
+		regionResources := scanRegion(region, config.ExcludedTypes)
+		totalResources = append(totalResources, regionResources...)
+		fmt.Printf("    Found %d resources\n", len(regionResources))
 	}
 	fmt.Println("")
+	fmt.Printf("📌 Total: %d resources\n", len(totalResources))
 	fmt.Println("✓ Scan complete")
 }
 
+func scanRegion(region string, excluded []string) []Resource {
+	var resources []Resource
+	instances := listEC2(region)
+	for _, inst := range instances {
+		if !isExcluded("EC2", excluded) {
+			resources = append(resources, inst)
+		}
+	}
+	stacks := listCloudFormation(region)
+	for _, stack := range stacks {
+		if !isExcluded("CloudFormation", excluded) {
+			resources = append(resources, stack)
+		}
+	}
+	return resources
+}
+
+func listEC2(region string) []Resource {
+	var resources []Resource
+	cmd := exec.Command("aws", "ec2", "describe-instances",
+		"--region", region,
+		"--query", "Reservations[*].Instances[*].[InstanceId,State.Name]",
+		"--output", "json")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return resources
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal(output, &data); err != nil {
+		return resources
+	}
+	if reservations, ok := data["Reservations"].([]interface{}); ok {
+		for _, res := range reservations {
+			if r, ok := res.(map[string]interface{}); ok {
+				if instances, ok := r["Instances"].([]interface{}); ok {
+					for _, inst := range instances {
+						if i, ok := inst.(map[string]interface{}); ok {
+							if id, ok := i["InstanceId"].(string); ok {
+								if state, ok := i["State"].(map[string]interface{}); ok {
+									if name, ok := state["Name"].(string); ok {
+										if name != "terminated" {
+											resources = append(resources, Resource{ID: id, Type: "EC2", Region: region})
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return resources
+}
+
+func listCloudFormation(region string) []Resource {
+	var resources []Resource
+	cmd := exec.Command("aws", "cloudformation", "describe-stacks",
+		"--region", region,
+		"--query", "Stacks[*].[StackName,StackStatus]",
+		"--output", "json")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return resources
+	}
+	var stacks []map[string]interface{}
+	json.Unmarshal(output, &stacks)
+	for _, stack := range stacks {
+		if name, ok := stack["StackName"].(string); ok {
+			if status, ok := stack["StackStatus"].(string); ok {
+				if status != "DELETE_IN_PROGRESS" && status != "DELETE_COMPLETE" {
+					resources = append(resources, Resource{ID: name, Type: "CloudFormation", Region: region})
+				}
+			}
+		}
+	}
+	return resources
+}
+
+func isExcluded(t string, excluded []string) bool {
+	for _, e := range excluded {
+		if e == t {
+			return true
+		}
+	}
+	return false
+}
+
 func clean() {
-	fmt.Println("🧹 Starting cleanup...")
 	config := loadConfig()
+	fmt.Printf("🧹 Starting cleanup (dry-run: %v)...\n", config.DryRun)
 	if config.DryRun {
 		fmt.Println("🔍 Dry run mode - no resources will be deleted")
-		fmt.Println("Set dry_run: false to enable deletion")
+		fmt.Println("")
+		fmt.Println("To actually delete resources:")
+		fmt.Println("  1. Edit .auto-aws-config.json")
+		fmt.Println("  2. Set dry_run: false")
+		fmt.Println("  3. Run: auto-aws-cleanup clean")
 		return
 	}
-	fmt.Println("⚠️  This will permanently delete resources!")
+	fmt.Println("⚠️  WARNING: This will permanently delete resources!")
 	fmt.Println("")
-	fmt.Println("✓ Cleanup complete")
+	fmt.Println("Preserving:")
+	for _, t := range config.ExcludedTypes {
+		fmt.Printf("  • %s\n", t)
+	}
+	fmt.Println("")
+	deletedCount := 0
+	for _, region := range config.Regions {
+		fmt.Printf("  📍 Cleaning %s...\n", region)
+		count, _ := deleteRegion(region, config.ExcludedTypes)
+		deletedCount += count
+	}
+	fmt.Println("")
+	fmt.Printf("✓ Deleted %d resources\n", deletedCount)
+}
+
+func deleteRegion(region string, excluded []string) (int, error) {
+	var deletedCount int
+	instances := listEC2(region)
+	for _, inst := range instances {
+		if !isExcluded("EC2", excluded) {
+			cmd := exec.Command("aws", "ec2", "terminate-instances",
+				"--region", region,
+				"--instance-ids", inst.ID)
+			output, err := cmd.CombinedOutput()
+			if err == nil {
+				deletedCount++
+				fmt.Printf("  🗑️  Terminated EC2: %s\n", inst.ID)
+			} else {
+				fmt.Printf("  ❌ Failed to terminate %s: %v\n", inst.ID, string(output))
+			}
+		}
+	}
+	stacks := listCloudFormation(region)
+	for _, stack := range stacks {
+		if !isExcluded("CloudFormation", excluded) {
+			cmd := exec.Command("aws", "cloudformation", "delete-stack",
+				"--region", region,
+				"--stack-name", stack.ID)
+			output, err := cmd.CombinedOutput()
+			if err == nil {
+				deletedCount++
+				fmt.Printf("  🗑️  Deleted CloudFormation: %s\n", stack.ID)
+			} else {
+				fmt.Printf("  ❌ Failed to delete %s: %v\n", stack.ID, string(output))
+			}
+		}
+	}
+	return deletedCount, nil
 }
 
 func status() {
