@@ -1,0 +1,8 @@
+auto-aws-cleanup
+auto-aws-cleanup-*
+*.exe
+*.json
+!example.json
+*.log
+dist/
+vendor/
